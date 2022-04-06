@@ -1,0 +1,1 @@
+# selfcare-uservice-party-mock-registry
