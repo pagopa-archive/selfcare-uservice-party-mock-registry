@@ -1,0 +1,177 @@
+# Deploy to Azure Kubernetes Service
+# Build and push image to Azure Container Registry; Deploy to Azure Kubernetes Service
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger: none
+pr: none
+
+resources:
+  - repo: self
+
+parameters:
+  - name: environment
+    displayName: Target Environment
+    type: string
+    values:
+      - dev
+      - uat
+      - prod
+  - name: 'executeBuild'
+    displayName: 'Remove this flag to skip build and proceed to deploy a docker image previously built'
+    type: boolean
+    default: true
+
+variables:
+  dockerfileRelativePath: '$(DOCKERFILE)' # Dockerfile
+
+  # Agent VM image name for Build
+  vmImageNameDefault: 'ubuntu-latest'
+
+  # Image Repository Name
+  imageRepository: '$(K8S_IMAGE_REPOSITORY_NAME)'
+  deployNamespace: '$(DEPLOY_NAMESPACE)'
+  deploymentName: '$(DEPLOYMENT_NAME)'
+
+  ${{ if eq(parameters['environment'], 'dev') }}:
+    environment: 'DEV'
+    dockerRegistryServiceConnection: '$(DEV_CONTAINER_REGISTRY_SERVICE_CONN)'
+    kubernetesServiceConnection: '$(DEV_KUBERNETES_SERVICE_CONN)'
+    containerRegistry: '$(DEV_CONTAINER_REGISTRY_NAME)'
+    selfHostedAgentPool: $(DEV_AGENT_POOL)
+
+  ${{ if eq(parameters['environment'], 'uat') }}:
+    environment: 'UAT'
+    dockerRegistryServiceConnection: '$(UAT_CONTAINER_REGISTRY_SERVICE_CONN)'
+    kubernetesServiceConnection: '$(UAT_KUBERNETES_SERVICE_CONN)'
+    containerRegistry: '$(UAT_CONTAINER_REGISTRY_NAME)'
+    selfHostedAgentPool: $(UAT_AGENT_POOL)
+
+  ${{ if eq(parameters['environment'], 'prod') }}:
+    environment: 'PROD'
+    dockerRegistryServiceConnection: '$(PROD_CONTAINER_REGISTRY_SERVICE_CONN)'
+    kubernetesServiceConnection: '$(PROD_KUBERNETES_SERVICE_CONN)'
+    containerRegistry: '$(PROD_CONTAINER_REGISTRY_NAME)'
+    selfHostedAgentPool: $(PROD_AGENT_POOL)
+
+# docker build -t container_tag --build-arg MYAPP_IMAGE=localimage:latest .
+
+stages:
+  - stage: 'DataPreparation'
+    displayName: 'Configuring_environment_to_deploy_into_${{ variables.environment }}'
+    jobs:
+      - job: DeterminingVersion
+        displayName: DeterminingVersion
+        pool:
+          vmImage: $(vmImageNameDefault)
+        steps:
+          - task: Bash@3
+            displayName: Get docker image version
+            name: getDockerImageVersion
+            condition: succeeded()
+            env:
+              VALUES_FILE: "helm/values-${{ lower(variables.environment) }}.yaml"
+              CHART_FILE: "helm/Chart.yaml"
+            inputs:
+              targetType: 'inline'
+              script: |
+                version=$(cat $VALUES_FILE | grep '^  tag:' | sed 's/^  tag:\s*//')
+                echo -e "\nappVersion: \"$version\"" >> $CHART_FILE
+                echo "##vso[task.setvariable variable=dockerImageVersion;isOutput=true]$version"
+              failOnStderr: true
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Artifact helm'
+            inputs:
+              targetPath: 'helm'
+              artifact: 'helm'
+              publishLocation: 'pipeline'
+  - stage: 'Build'
+    displayName: 'Build_and_Pusblih_to_${{ variables.environment }}'
+    condition: and( succeeded(), ${{ parameters.executeBuild }} )
+    dependsOn: DataPreparation
+    variables:
+      dockerImageVersion: $[ stageDependencies.DataPreparation.DeterminingVersion.outputs['getDockerImageVersion.dockerImageVersion'] ]
+    jobs:
+      - job: Build
+        displayName: Build
+        pool:
+          vmImage: $(vmImageNameDefault)
+        steps:
+          - task: Docker@2
+            displayName: 'Build_image'
+            condition: succeeded()
+            inputs:
+              containerRegistry: '$(COMMON_CONTAINER_REGISTRY_SERVICE_CONN)'
+              repository: '$(imageRepository)'
+              command: 'Build'
+              Dockerfile: '$(Build.Repository.LocalPath)/$(dockerfileRelativePath)'
+              buildContext: '$(Build.Repository.LocalPath)'
+              arguments: --build-arg APP_IMAGE=$(DOCKER_BASE_IMAGE_NAME):$(dockerImageVersion)
+              tags: |
+                $(Build.BuildNumber)
+                latest
+                $(dockerImageVersion)
+          - script: |
+              docker tag '$(COMMON_CONTAINER_REGISTRY_NAME)/$(imageRepository):latest' '$(containerRegistry)/$(imageRepository):latest'
+              docker tag '$(COMMON_CONTAINER_REGISTRY_NAME)/$(imageRepository):$(Build.BuildNumber)' '$(containerRegistry)/$(imageRepository):$(Build.BuildNumber)'
+              docker tag '$(COMMON_CONTAINER_REGISTRY_NAME)/$(imageRepository):$(dockerImageVersion)' '$(containerRegistry)/$(imageRepository):$(dockerImageVersion)'
+            displayName: 'Tag_image'
+          - task: Docker@2
+            displayName: 'Publish_image_to_${{ variables.environment }}'
+            condition: succeeded()
+            inputs:
+              containerRegistry: '$(dockerRegistryServiceConnection)'
+              repository: '$(imageRepository)'
+              command: 'push'
+              Dockerfile: '$(Build.Repository.LocalPath)/$(dockerfileRelativePath)'
+              buildContext: '$(Build.Repository.LocalPath)'
+              tags: |
+                $(Build.BuildNumber)
+                latest
+                $(dockerImageVersion)
+
+  - stage: 'Deploy'
+    displayName: 'Deploy_to_${{ variables.environment }}'
+    dependsOn: ['DataPreparation', 'Build']
+    condition: or(succeeded(), and( not(${{ parameters.executeBuild }}), succeeded('DataPreparation') ))
+    variables:
+      dockerImageVersion: $[ stageDependencies.DataPreparation.DeterminingVersion.outputs['getDockerImageVersion.dockerImageVersion'] ]
+    jobs:
+      - deployment: 'Deploy_to_${{ variables.environment }}'
+        displayName: 'Deploy_to_${{ variables.environment }}'
+        pool:
+          name: $(selfHostedAgentPool)
+        environment: '$(environment)'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'helm'
+                    targetPath: '$(Pipeline.Workspace)/helm'
+                - task: HelmDeploy@0
+                  displayName: Helm upgrade
+                  inputs:
+                    kubernetesServiceEndpoint: ${{ variables.kubernetesServiceConnection }}
+                    namespace: '$(deployNamespace)'
+                    command: upgrade
+                    chartType: filepath
+                    chartPath: $(Pipeline.Workspace)/helm
+                    chartName: $(K8S_IMAGE_REPOSITORY_NAME)
+                    releaseName: $(K8S_IMAGE_REPOSITORY_NAME)
+                    valueFile: "$(Pipeline.Workspace)/helm/values-${{ lower(variables.environment) }}.yaml"
+                    install: true
+                    waitForExecution: true
+                    arguments: "--timeout 2m0s"
+                - task: KubernetesManifest@0
+                  displayName: Patch deployment to force the reload
+                  inputs:
+                    kubernetesServiceConnection: ${{ variables.kubernetesServiceConnection }}
+                    namespace: '$(deployNamespace)'
+                    action: patch
+                    kind: deployment
+                    name: '$(deploymentName)'
+                    mergeStrategy: strategic
+                    patch: '{"spec":{"template":{"metadata":{"annotations":{"buildNumber":"$(Build.BuildNumber)"}}}}}'
