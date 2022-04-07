@@ -92,4 +92,4 @@ affinity: {}
 config:
   APPLICATIONINSIGHTS_ROLE_NAME: "uservice-party-mock-registry"
   POSTGRES_SCHEMA: "mock_registry"
-  ENABLED_PROJECTIONS: "false" # TODO
+  ENABLED_PROJECTIONS: "false"
