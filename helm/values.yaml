@@ -91,5 +91,6 @@ affinity: {}
 
 config:
   APPLICATIONINSIGHTS_ROLE_NAME: "uservice-party-mock-registry"
+  APPLICATIONINSIGHTS_INSTRUMENTATION_JDBC_ENABLED: 'false' # this instrumentation will go in conflict with the application (after upgrade to 0.1.11)
   POSTGRES_SCHEMA: "mock_registry"
   ENABLED_PROJECTIONS: "false"
